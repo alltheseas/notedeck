@@ -36,7 +36,6 @@ pub struct CalendarDefinition {
     pub description: Option<String>,
     pub author_hex: String,
     pub created_at: u64,
-    pub is_private: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -595,8 +594,6 @@ pub fn parse_calendar_definition(note: &Note<'_>) -> Option<CalendarDefinition> 
 
     let mut identifier = None;
     let mut title = None;
-    let mut is_private = false;
-
     for tag in note.tags() {
         if tag.count() < 2 {
             continue;
@@ -621,13 +618,6 @@ pub fn parse_calendar_definition(note: &Note<'_>) -> Option<CalendarDefinition> 
                 if title.is_none() {
                     if let Some(value) = tag.get_str(1) {
                         title = Some(value.to_owned());
-                    }
-                }
-            }
-            "privacy" => {
-                if let Some(value) = tag.get_str(1) {
-                    if value.eq_ignore_ascii_case("private") {
-                        is_private = true;
                     }
                 }
             }
@@ -657,7 +647,6 @@ pub fn parse_calendar_definition(note: &Note<'_>) -> Option<CalendarDefinition> 
         description,
         author_hex,
         created_at: note.created_at(),
-        is_private,
     })
 }
 

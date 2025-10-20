@@ -14,11 +14,7 @@ use egui::{
 use hex::FromHex;
 use iana_time_zone::get_timezone;
 use nostr::nips::nip19::{FromBech32, Nip19};
-use nostr::nips::nip44::{self, Version as Nip44Version};
-use nostr::nips::nip59::RANGE_RANDOM_TIMESTAMP_TWEAK;
-use nostr::{
-    Event as NostrEvent, JsonUtil, Keys as NostrKeys, PublicKey as NostrPublicKey, UnsignedEvent,
-};
+use nostr::PublicKey as NostrPublicKey;
 use nostrdb::{Filter, IngestMetadata, Note, ProfileRecord, Transaction};
 use notedeck::enostr::{ClientMessage, FullKeypair};
 use notedeck::filter::UnifiedSubscription;
@@ -32,10 +28,9 @@ use notedeck_ui::{
     app_images::{copy_to_clipboard_dark_image, copy_to_clipboard_image},
     AnimationHelper, ProfilePic,
 };
-use rand::Rng;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration as StdDuration, Instant};
 use std::{
     borrow::Cow,
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -96,7 +91,6 @@ struct CalendarEventDraft {
     include_end: bool,
     start_tzid: String,
     end_tzid: String,
-    is_private: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,7 +98,6 @@ struct CalendarDraft {
     identifier: String,
     title: String,
     description: String,
-    is_private: bool,
 }
 
 impl CalendarDraft {
@@ -113,14 +106,11 @@ impl CalendarDraft {
             identifier: Self::new_identifier(),
             title: String::new(),
             description: String::new(),
-            is_private: false,
         }
     }
 
     fn reset(&mut self) {
-        let is_private = self.is_private;
         *self = Self::new();
-        self.is_private = is_private;
     }
 
     fn new_identifier() -> String {
@@ -156,7 +146,6 @@ impl CalendarEventDraft {
             include_end: false,
             start_tzid: guessed.clone(),
             end_tzid: guessed,
-            is_private: false,
         }
     }
 
@@ -166,10 +155,8 @@ impl CalendarEventDraft {
 
     fn reset_preserving_type(&mut self) {
         let event_type = self.event_type;
-        let is_private = self.is_private;
         let selected = self.selected_calendars.clone();
         *self = Self::with_kind(event_type);
-        self.is_private = is_private;
         self.selected_calendars = selected;
     }
 
@@ -600,7 +587,6 @@ pub struct CalendarApp {
     calendar_creation_pending: bool,
     calendar_creation_feedback: Option<(Instant, CalendarCreationFeedback)>,
     calendar_draft: CalendarDraft,
-    private_calendars: HashSet<String>,
     wot_only: bool,
     wot_cache: Option<WebOfTrustCache>,
     user_pubkey_hex: String,
@@ -647,7 +633,6 @@ impl CalendarApp {
             calendar_creation_pending: false,
             calendar_creation_feedback: None,
             calendar_draft: CalendarDraft::new(),
-            private_calendars: HashSet::new(),
             wot_only: true,
             wot_cache: None,
             user_pubkey_hex: String::new(),
@@ -814,14 +799,6 @@ impl CalendarApp {
 
         self.events = events;
         self.calendars = calendars;
-        self.private_calendars
-            .retain(|coord| self.calendars.contains_key(coord));
-        for (coord, definition) in self.calendars.iter_mut() {
-            if definition.is_private || self.private_calendars.contains(coord) {
-                definition.is_private = true;
-                self.private_calendars.insert(coord.clone());
-            }
-        }
         self.prune_selected_calendars();
         self.ensure_calendar_placeholders(ctx);
         self.prune_hidden_calendars();
@@ -935,7 +912,7 @@ impl CalendarApp {
                     ctx.unknown_ids.add_pubkey_if_missing(ctx.ndb, txn, &bytes);
                 }
 
-                let mut definition = CalendarDefinition {
+                let definition = CalendarDefinition {
                     coordinate: coordinate.clone(),
                     id_hex: String::new(),
                     identifier: identifier.clone(),
@@ -943,11 +920,7 @@ impl CalendarApp {
                     description: None,
                     author_hex,
                     created_at: 0,
-                    is_private: false,
                 };
-                if self.private_calendars.contains(coordinate) {
-                    definition.is_private = true;
-                }
                 self.calendars.insert(coordinate.clone(), definition);
                 added = true;
             }
@@ -959,13 +932,8 @@ impl CalendarApp {
         }
     }
 
-    fn upsert_calendar(&mut self, mut calendar: CalendarDefinition) {
+    fn upsert_calendar(&mut self, calendar: CalendarDefinition) {
         let coordinate = calendar.coordinate.clone();
-        if calendar.is_private {
-            self.private_calendars.insert(coordinate.clone());
-        } else if self.private_calendars.contains(&coordinate) {
-            calendar.is_private = true;
-        }
 
         let mut updated = false;
         match self.calendars.entry(coordinate.clone()) {
@@ -985,11 +953,6 @@ impl CalendarApp {
         }
 
         if updated {
-            if let Some(definition) = self.calendars.get(&coordinate) {
-                if definition.is_private {
-                    self.private_calendars.insert(coordinate.clone());
-                }
-            }
             self.prune_hidden_calendars();
             self.prune_selected_calendars();
         }
@@ -1036,12 +999,6 @@ impl CalendarApp {
             })
             .cloned()
             .collect();
-
-        for calendar in &mut owned {
-            if self.private_calendars.contains(&calendar.coordinate) {
-                calendar.is_private = true;
-            }
-        }
 
         owned.sort_by(|a, b| {
             let label_a = a.title.to_lowercase();
@@ -1373,31 +1330,6 @@ impl CalendarApp {
         ui.text_edit_multiline(&mut self.calendar_draft.description)
             .on_hover_text("Optional description shown to anyone viewing the calendar");
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Visibility");
-            let toggle_response = ui.add(IosSwitch::new(&mut self.calendar_draft.is_private));
-            if toggle_response.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-
-            let label = if self.calendar_draft.is_private {
-                "Private calendar"
-            } else {
-                "Public calendar"
-            };
-            ui.add_space(8.0);
-            ui.label(label);
-
-            let tooltip = if self.calendar_draft.is_private {
-                "Private calendars are only visible to you."
-            } else {
-                "Public calendars are visible to anyone."
-            };
-
-            Self::info_icon(ui, tooltip);
-        });
-
         ui.add_space(10.0);
         let publish_button = ui.add_enabled(
             !self.calendar_creation_pending,
@@ -1451,43 +1383,6 @@ impl CalendarApp {
                 DraftEventType::AllDay,
                 "All-day",
             );
-        });
-
-        ui.add_space(6.0);
-
-        ui.horizontal(|ui| {
-            ui.label("Visibility");
-            let toggle_response = ui.add(IosSwitch::new(&mut self.event_draft.is_private));
-            if toggle_response.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-
-            let visibility_text = if self.event_draft.is_private {
-                "Private event"
-            } else {
-                "Public event"
-            };
-
-            ui.add_space(8.0);
-            ui.label(visibility_text);
-
-            let tooltip_text = if self.event_draft.is_private {
-                "Private events are only visible to you, and the invited participants."
-            } else {
-                "Public events are visible to anyone."
-            };
-
-            let info_response = Self::info_icon(ui, tooltip_text);
-            if info_response.clicked() {
-                egui::show_tooltip_at_pointer(
-                    ui.ctx(),
-                    ui.layer_id(),
-                    info_response.id,
-                    |ui: &mut egui::Ui| {
-                        ui.label(tooltip_text);
-                    },
-                );
-            }
         });
 
         ui.add_space(6.0);
@@ -1604,7 +1499,8 @@ impl CalendarApp {
                         calendar.identifier,
                         truncated_identifier(&calendar.author_hex)
                     );
-                    let mut response = ui.checkbox(&mut selected, title.clone());
+                    let mut response =
+                        ui.add(egui::Checkbox::new(&mut selected, title.clone()));
                     response = response.on_hover_text(tooltip.clone());
                     if response.changed() {
                         if selected {
@@ -1785,19 +1681,7 @@ impl CalendarApp {
                         .process_event_with(&json, IngestMetadata::new().client(true));
                 }
 
-                let private_count = if self.event_draft.is_private {
-                    match self.publish_private_event(ctx, &account, &note, &event) {
-                        Ok(count) => Some(count),
-                        Err(err) => {
-                            self.creation_pending = false;
-                            self.set_creation_feedback(EventCreationFeedback::Error(err));
-                            return;
-                        }
-                    }
-                } else {
-                    ctx.pool.send(&event_msg);
-                    None
-                };
+                ctx.pool.send(&event_msg);
 
                 self.upsert_event(event);
                 self.resort_events();
@@ -1811,19 +1695,9 @@ impl CalendarApp {
                 self.creating_event = false;
                 self.event_draft.reset_preserving_type();
 
-                let success_msg = match private_count {
-                    Some(0) => {
-                        "Private calendar event prepared, but no recipients resolved.".to_string()
-                    }
-                    Some(1) => "Private calendar event gift wrapped for 1 recipient.".to_string(),
-                    Some(count) => format!(
-                        "Private calendar event gift wrapped for {} recipients.",
-                        count
-                    ),
-                    None => "Calendar event published.".to_string(),
-                };
-
-                self.set_creation_feedback(EventCreationFeedback::Success(success_msg));
+                self.set_creation_feedback(EventCreationFeedback::Success(
+                    "Calendar event published.".to_string(),
+                ));
             }
             Err(err) => {
                 self.creation_pending = false;
@@ -1862,7 +1736,7 @@ impl CalendarApp {
         self.calendar_creation_pending = true;
 
         match self.build_calendar_note(&self.calendar_draft, &account) {
-            Ok((note, mut calendar)) => {
+            Ok((note, calendar)) => {
                 let calendar_msg = match ClientMessage::event(&note) {
                     Ok(msg) => msg,
                     Err(err) => {
@@ -1880,20 +1754,8 @@ impl CalendarApp {
                         .process_event_with(&json, IngestMetadata::new().client(true));
                 }
 
-                if self.calendar_draft.is_private {
-                    if let Err(err) = self.publish_private_calendar(ctx, &account, &note) {
-                        self.calendar_creation_pending = false;
-                        self.set_calendar_creation_feedback(CalendarCreationFeedback::Error(err));
-                        return;
-                    }
-                } else {
-                    ctx.pool.send(&calendar_msg);
-                }
+                ctx.pool.send(&calendar_msg);
 
-                calendar.is_private = self.calendar_draft.is_private;
-                if calendar.is_private {
-                    self.private_calendars.insert(calendar.coordinate.clone());
-                }
                 self.upsert_calendar(calendar);
                 self.calendar_creation_pending = false;
                 self.creating_calendar = false;
@@ -2089,10 +1951,6 @@ impl CalendarApp {
         builder = builder.start_tag().tag_str("title").tag_str(title);
         builder = builder.start_tag().tag_str("name").tag_str(title);
 
-        if draft.is_private {
-            builder = builder.start_tag().tag_str("privacy").tag_str("private");
-        }
-
         let secret_bytes = account.secret_key.secret_bytes();
         let Some(note) = builder.sign(&secret_bytes).build() else {
             return Err("Failed to build calendar.".to_string());
@@ -2105,142 +1963,6 @@ impl CalendarApp {
         Ok((note, calendar))
     }
 
-    fn private_recipients(event: &CalendarEvent, account: &FullKeypair) -> Vec<String> {
-        let mut recipients: HashSet<String> = HashSet::new();
-        recipients.insert(account.pubkey.hex().to_ascii_lowercase());
-
-        for participant in &event.participants {
-            if participant.pubkey_hex.len() == 64 {
-                recipients.insert(participant.pubkey_hex.to_ascii_lowercase());
-            }
-        }
-
-        recipients.into_iter().collect()
-    }
-
-    fn random_backdated_timestamp() -> u64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let mut rng = rand::rng();
-        let range = RANGE_RANDOM_TIMESTAMP_TWEAK;
-        let tweak = if range.start >= range.end {
-            0
-        } else {
-            rng.random_range(range)
-        };
-
-        now.saturating_sub(tweak)
-    }
-
-    fn publish_private_note(
-        &self,
-        ctx: &mut AppContext,
-        account: &FullKeypair,
-        note: &nostrdb::Note<'static>,
-        recipients: &[String],
-    ) -> Result<usize, String> {
-        if recipients.is_empty() {
-            return Err("No recipients resolved for private publish.".to_string());
-        }
-
-        let note_json = note
-            .json()
-            .map_err(|err| format!("Failed to serialize event: {err}"))?;
-        let event_for_rumor = NostrEvent::from_json(note_json)
-            .map_err(|err| format!("Failed to parse event: {err}"))?;
-        let rumor_json = UnsignedEvent::from(event_for_rumor).as_json();
-
-        let account_secret_bytes = account.secret_key.secret_bytes();
-        let mut wrapped_count = 0usize;
-
-        for recipient_hex in recipients {
-            let recipient_pk = NostrPublicKey::from_hex(&recipient_hex)
-                .map_err(|_| format!("Invalid recipient pubkey: {}", recipient_hex))?;
-
-            let encrypted_rumor = nip44::encrypt(
-                &account.secret_key,
-                &recipient_pk,
-                &rumor_json,
-                Nip44Version::default(),
-            )
-            .map_err(|err| format!("Failed to encrypt rumor for {}: {err}", recipient_hex))?;
-
-            let mut seal_builder = nostrdb::NoteBuilder::new()
-                .kind(13)
-                .content(&encrypted_rumor)
-                .created_at(Self::random_backdated_timestamp());
-            seal_builder = seal_builder.sign(&account_secret_bytes);
-            let Some(seal_note) = seal_builder.build() else {
-                return Err("Failed to build seal event.".to_string());
-            };
-
-            let seal_json = seal_note
-                .json()
-                .map_err(|err| format!("Failed to serialize seal event: {err}"))?;
-            let keys = NostrKeys::generate();
-            let encrypted_seal = nip44::encrypt(
-                keys.secret_key(),
-                &recipient_pk,
-                &seal_json,
-                Nip44Version::default(),
-            )
-            .map_err(|err| format!("Failed to encrypt gift wrap for {}: {err}", recipient_hex))?;
-
-            let mut gift_builder = nostrdb::NoteBuilder::new()
-                .kind(1059)
-                .content(&encrypted_seal)
-                .created_at(Self::random_backdated_timestamp());
-            gift_builder = gift_builder
-                .start_tag()
-                .tag_str("p")
-                .tag_str(&recipient_hex);
-
-            let ephemeral_secret_bytes = keys.secret_key().secret_bytes();
-            gift_builder = gift_builder.sign(&ephemeral_secret_bytes);
-            let Some(gift_note) = gift_builder.build() else {
-                return Err("Failed to build gift wrap event.".to_string());
-            };
-
-            let gift_msg = ClientMessage::event(&gift_note)
-                .map_err(|err| format!("Failed to serialize gift wrap event: {err}"))?;
-
-            if let Ok(json) = gift_msg.to_json() {
-                let _ = ctx
-                    .ndb
-                    .process_event_with(&json, IngestMetadata::new().client(true));
-            }
-
-            ctx.pool.send(&gift_msg);
-
-            wrapped_count += 1;
-        }
-
-        Ok(wrapped_count)
-    }
-
-    fn publish_private_event(
-        &self,
-        ctx: &mut AppContext,
-        account: &FullKeypair,
-        note: &nostrdb::Note<'static>,
-        event: &CalendarEvent,
-    ) -> Result<usize, String> {
-        let recipients = Self::private_recipients(event, account);
-        self.publish_private_note(ctx, account, note, &recipients)
-    }
-
-    fn publish_private_calendar(
-        &self,
-        ctx: &mut AppContext,
-        account: &FullKeypair,
-        note: &nostrdb::Note<'static>,
-    ) -> Result<usize, String> {
-        let recipients = vec![account.pubkey.hex().to_ascii_lowercase()];
-        self.publish_private_note(ctx, account, note, &recipients)
-    }
 
     fn current_user_rsvp(&self, event: &CalendarEvent) -> Option<RsvpStatus> {
         if self.user_pubkey_hex.is_empty() {
@@ -2686,9 +2408,6 @@ impl CalendarApp {
 
                         let mut tooltip =
                             format!("Owner: {creator_name}\nIdentifier: {}", calendar.identifier);
-                        if calendar.is_private {
-                            tooltip.push_str("\nPrivate calendar");
-                        }
                         if let Some(desc) = &calendar.description {
                             let trimmed = desc.trim();
                             if !trimmed.is_empty() {
@@ -2724,15 +2443,6 @@ impl CalendarApp {
                             }
 
                             ui.add_space(8.0);
-                            if calendar.is_private {
-                                let icon_resp = Self::private_calendar_icon(ui)
-                                    .on_hover_text("Private calendar");
-                                if icon_resp.clicked() {
-                                    toggle_request = true;
-                                }
-                                ui.add_space(6.0);
-                            }
-
                             ui.vertical(|ui| {
                                 let title_resp = ui
                                     .add(
@@ -3069,14 +2779,7 @@ impl CalendarApp {
                                     Self::readable_calendar_title(definition, &creator_name);
 
                                 ui.vertical(|ui| {
-                                    ui.horizontal(|ui| {
-                                        if definition.is_private {
-                                            Self::private_calendar_icon(ui)
-                                                .on_hover_text("Private calendar");
-                                            ui.add_space(6.0);
-                                        }
-                                        ui.label(display_title.clone());
-                                    });
+                                    ui.label(display_title.clone());
                                     ui.label(
                                         egui::RichText::new(format!("Owner: {}", creator_name))
                                             .weak(),
@@ -3349,42 +3052,6 @@ impl CalendarApp {
         response.on_hover_text(tooltip)
     }
 
-    fn private_calendar_icon(ui: &mut egui::Ui) -> egui::Response {
-        let size = vec2(16.0, 18.0);
-        let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-        let painter = ui.painter_at(rect);
-        let visuals = ui.style().visuals.clone();
-
-        let shackle_radius = 5.0;
-        let shackle_center = pos2(rect.center().x, rect.top() + shackle_radius + 1.0);
-        painter.circle_stroke(
-            shackle_center,
-            shackle_radius,
-            Stroke::new(1.2, visuals.strong_text_color()),
-        );
-
-        let cover_rect =
-            egui::Rect::from_min_max(pos2(rect.left(), shackle_center.y), rect.right_top());
-        painter.rect_filled(cover_rect, 0.0, visuals.extreme_bg_color);
-
-        let body_rect = egui::Rect::from_min_size(
-            pos2(rect.left() + 3.0, shackle_center.y - 1.0),
-            vec2(rect.width() - 6.0, rect.height() - shackle_radius - 4.0),
-        );
-        let body_fill = visuals.widgets.inactive.bg_fill.gamma_multiply(0.8);
-        painter.rect_filled(body_rect, 2.0, body_fill);
-        painter.rect_stroke(
-            body_rect,
-            2.0,
-            Stroke::new(1.2, visuals.strong_text_color()),
-            StrokeKind::Inside,
-        );
-
-        let keyhole_center = pos2(rect.center().x, body_rect.center().y);
-        painter.circle_filled(keyhole_center, 1.4, visuals.strong_text_color());
-
-        response
-    }
 }
 
 impl Default for CalendarApp {
@@ -3642,6 +3309,7 @@ fn default_timezone_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nostr::Keys as NostrKeys;
     use nostr::nips::nip19::{Nip19, Nip19Profile, ToBech32};
 
     #[test]
